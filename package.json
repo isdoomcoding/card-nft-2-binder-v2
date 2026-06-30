@@ -1,0 +1,42 @@
+{
+  "name": "biscuit",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "traits": "tsx src/traits.ts",
+    "traits:card": "tsx src/traits.ts --slug card_nft_2",
+    "tensor": "tsx src/cli-tensor.ts",
+    "binder": "vite --config vite.config.ts --logLevel info",
+    "binder:force": "vite --config vite.config.ts --force",
+    "binder:debug": "vite --config vite.config.ts --force --logLevel info",
+    "binder:kill": "lsof -ti:5173 | xargs kill -9 2>/dev/null || true; echo 'port cleared'",
+    "binder:build": "vite build --config vite.config.ts",
+    "binder:preview": "vite build --config vite.config.ts && vite preview --config vite.config.ts --port 5174 --host 127.0.0.1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "firebase": "^12.14.0",
+    "lucide-react": "^0.378.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "tsx": "^4.19.2",
+    "vite": "^5.2.11"
+  }
+}

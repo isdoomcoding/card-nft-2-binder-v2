@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment secrets - NEVER commit these
+.env*
+!.env.example
+
+# Build output
+dist/
+
+# Generated / cache
+data/
+
+# Claude Code local config and memory
+.claude/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Misc
+*.tsbuildinfo
