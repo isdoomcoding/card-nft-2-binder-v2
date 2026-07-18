@@ -16,7 +16,8 @@
     "binder:debug": "vite --config vite.config.ts --force --logLevel info",
     "binder:kill": "lsof -ti:5173 | xargs kill -9 2>/dev/null || true; echo 'port cleared'",
     "binder:build": "vite build --config vite.config.ts",
-    "binder:preview": "vite build --config vite.config.ts && vite preview --config vite.config.ts --port 5174 --host 127.0.0.1"
+    "binder:preview": "vite build --config vite.config.ts && vite preview --config vite.config.ts --port 5174 --host 127.0.0.1",
+    "css:build": "tailwindcss -c tailwind.config.cjs -i tailwind-src.css -o tailwind.css --minify"
   },
   "keywords": [],
   "author": "",
