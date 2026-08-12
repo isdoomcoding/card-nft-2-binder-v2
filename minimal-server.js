@@ -121,6 +121,48 @@ function createCollectionState(cfg) {
 
 const STATES = Object.fromEntries(Object.keys(COLLECTIONS).map(k => [k, createCollectionState(COLLECTIONS[k])]));
 
+// Page routes -> collection slug, so a page load can be attributed to a collection.
+const PAGE_ROUTES = new Map();
+for (const st of Object.values(STATES))
+  for (const r of st.cfg.htmlRoutes) PAGE_ROUTES.set(r, st.cfg.slug);
+
+// === Traffic stats (in-memory, resets on restart — a deploy/pm2 restart resets the
+// "today" window early; not persisted to disk, this is meant as a rough signal, not
+// a source of truth). Also logs whether the funnel forwards a real client IP at all. ===
+const STATS_SECRET = process.env.STATS_SECRET || WEBHOOK_SECRET;
+let stats = freshStats();
+function freshStats() {
+  return { since: Date.now(), pageLoads: 0, walletLookupsFresh: 0, walletLookupsCached: 0, ips: new Set(), pageLoadsBySlug: {} };
+}
+function trackHit(req) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  stats.ips.add(ip);
+}
+function statsSnapshot() {
+  const collections = {};
+  for (const st of Object.values(STATES)) {
+    collections[st.cfg.slug] = {
+      pageLoads: stats.pageLoadsBySlug[st.cfg.slug] || 0,
+      uniqueAddressesLookedUp: st.walletCache.size,
+      assets: st.collectionCache?.data.length || 0,
+      listed: listingsCache.get(`merged:${st.cfg.slug}`)?.data.length || 0,
+    };
+  }
+  return {
+    since: new Date(stats.since).toISOString(),
+    pageLoads: stats.pageLoads,
+    walletLookupsFresh: stats.walletLookupsFresh,
+    walletLookupsCached: stats.walletLookupsCached,
+    uniqueIPsSeen: stats.ips.size,
+    sampleIP: stats.ips.size ? [...stats.ips][0] : null, // sanity check: is this a real client IP or always the funnel's?
+    collections,
+  };
+}
+setInterval(() => {
+  console.log('[stats]', JSON.stringify(statsSnapshot()));
+  stats = freshStats();
+}, 24 * 60 * 60 * 1000);
+
 function isFresh(entry, ttl) { return !!entry && (Date.now() - (entry.ts || 0) < ttl); }
 
 function clientAcceptsGzip(req) { return /\bgzip\b/.test(req.headers['accept-encoding'] || ''); }
@@ -509,6 +551,17 @@ const server = http.createServer(async (req, res) => {
     return res.end('ok');
   }
 
+  // 2c. /stats?key=<STATS_SECRET> — quick on-demand traffic snapshot (today so far).
+  // Deliberately un-namespaced (one process serves every collection) so the URL is
+  // stable across collections; the payload breaks the numbers down per collection.
+  if (req.method === 'GET' && p === '/stats') {
+    const sp = new URL(req.url, 'http://local').searchParams;
+    if (!STATS_SECRET || sp.get('key') !== STATS_SECRET) {
+      return writeJson(res, 401, { error: 'unauthorized' });
+    }
+    return writeJson(res, 200, statsSnapshot());
+  }
+
   // 3. Static files — STRICT allowlist, cached (read+gzip+ETag once per process).
   // Paths are hardcoded — never derived from the URL — so no traversal risk.
   const STATIC = {
@@ -521,6 +574,12 @@ const server = http.createServer(async (req, res) => {
       STATIC[route] = [st.cfg.htmlFile, 'text/html; charset=utf-8', 'no-cache'];
   const staticEntry = req.method === 'GET' && STATIC[p];
   if (staticEntry) {
+    const pageSlug = PAGE_ROUTES.get(p);
+    if (pageSlug) {
+      trackHit(req);
+      stats.pageLoads++;
+      stats.pageLoadsBySlug[pageSlug] = (stats.pageLoadsBySlug[pageSlug] || 0) + 1;
+    }
     try {
       const file = getStaticFile(p, staticEntry[0], staticEntry[1], staticEntry[2]);
       serveStatic(req, res, file);
@@ -624,13 +683,16 @@ const server = http.createServer(async (req, res) => {
     const sp = new URL(req.url, 'http://local').searchParams;
     const addr = (sp.get('address') || '').trim();
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return writeJson(res, 400, { error: 'Invalid Solana address.' });
+    trackHit(req);
     const cached = st.walletCache.get(addr);
     if (cached && Date.now() - cached.ts < WALLET_TTL) {
+      stats.walletLookupsCached++;
       return writeJson(res, 200, { address: addr, count: cached.mints.length, mints: cached.mints }, { 'x-source': 'wallet-cache' });
     }
     try {
       const mints = await fetchWalletHoldings(st, addr);
       st.walletCache.set(addr, { mints, ts: Date.now() });
+      stats.walletLookupsFresh++;
       return writeJson(res, 200, { address: addr, count: mints.length, mints }, { 'x-source': 'helius-live' });
     } catch (e) {
       console.error(`[wallet:${st.cfg.slug}] lookup failed for`, addr, ':', e);

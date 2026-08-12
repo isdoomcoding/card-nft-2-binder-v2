@@ -1067,8 +1067,15 @@
     // it for cdn.lil.org's tightly-cropped version (same art, full card frame,
     // no wasted pixels on padding). Receipts intentionally keep their own
     // (stamped "redeemed") image, so only rewrite the plain /items/N.webp path.
+    // Host-agnostic on purpose: the on-chain metadata has already moved once
+    // (assets.mons.link/drops/poncho/items/N -> cdn.lil.org/nft/poncho_drifella/items/N),
+    // and the plain `items/N` asset is a 2000x2000 padded square that gets cropped by
+    // object-fit on a 5:7 tile. Match any `/items/N.webp` and swap in the cropped
+    // `items/clean/N.webp` (772x1080). Receipts (/receipts/) and packs (pack.webp)
+    // deliberately don't match — they keep their own artwork.
     function _ponchoCleanImg(url) {
-      const m = url && url.match(/\/drops\/poncho\/items\/(\d+)\.webp/);
+      if (!url || url.includes('/items/clean/')) return url;
+      const m = url.match(/\/items\/(\d+)\.webp/);
       return m ? `https://cdn.lil.org/nft/poncho_drifella/items/clean/${m[1]}.webp` : url;
     }
 
