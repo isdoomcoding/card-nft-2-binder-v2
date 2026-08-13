@@ -947,6 +947,16 @@
       return thumbUrl(getImage(asset));
     }
 
+    // Shared by makeCard and healMissingImagePreviews so the two can't drift apart.
+    function cardImageMarkup(asset) {
+      const img = getImage(asset);
+      const safeName = escapeHtml(asset?.content?.metadata?.name || 'Unnamed');
+      const thumb = img ? escapeHtml(getCdnThumb(asset)) : '';
+      return img
+        ? `<img src="${thumb}" alt="${safeName}" loading="lazy" decoding="async">`
+        : `<div class="w-full h-full bg-zinc-950 flex items-center justify-center text-zinc-700 text-sm">no preview</div>`;
+    }
+
     // Load the full collection from the server
     async function loadCollectionSnapshot() {
       const res = await fetch('/collection');
@@ -1344,10 +1354,9 @@
       card.className = 'card group cursor-pointer';
       card.dataset.mint = asset.id;
       const safeName = escapeHtml(name);
-      const thumb = img ? escapeHtml(getCdnThumb(asset)) : '';
       card.innerHTML = `
         <div class="card-image">
-          ${img ? `<img src="${thumb}" alt="${safeName}" loading="lazy" decoding="async">` : `<div class="w-full h-full bg-zinc-950 flex items-center justify-center text-zinc-700 text-sm">no preview</div>`}
+          ${cardImageMarkup(asset)}
           ${isListed ? `<div class="listed-badge">LISTED • ${listed.priceSol.toFixed(2)} SOL</div>` : ''}
         </div>
         <div class="p-3.5">
@@ -1430,6 +1439,40 @@
       };
       (newMints || []).forEach(patch);
       (delistedMints || []).forEach(patch);
+    }
+
+    // The collection snapshot is fetched once at page load; a card whose off-chain
+    // metadata hadn't finished indexing yet at that moment renders "no preview" and,
+    // absent this, stays that way for the rest of the session even after the server's
+    // own background poll picks up the corrected image a few minutes later. Retry a
+    // few times so those cards heal in place without a jarring full grid re-render.
+    async function healMissingImagePreviews(attempt = 1) {
+      if (!assets.some(a => !getImage(a))) return;
+      try {
+        const snap = await loadCollectionSnapshot();
+        if (Array.isArray(snap)) {
+          const byId = new Map(snap.map(a => [a.id, a]));
+          const grid = document.getElementById('grid');
+          const esc = (x) => (window.CSS && CSS.escape) ? CSS.escape(x) : x;
+          for (let i = 0; i < assets.length; i++) {
+            const stale = assets[i];
+            if (getImage(stale)) continue;
+            const fresh = byId.get(stale.id);
+            if (!fresh || !getImage(fresh)) continue;
+            assets[i] = fresh;
+            const card = grid?.querySelector('.card[data-mint="' + esc(fresh.id) + '"]');
+            const placeholder = card?.querySelector('.card-image > :first-child');
+            if (placeholder) {
+              const tmp = document.createElement('div');
+              tmp.innerHTML = cardImageMarkup(fresh);
+              const imgEl = tmp.firstElementChild;
+              placeholder.replaceWith(imgEl);
+              if (imgEl.tagName === 'IMG') { const url = getImage(fresh); imgEl.onerror = () => { imgEl.onerror = null; imgEl.src = url; }; }
+            }
+          }
+        }
+      } catch {}
+      if (attempt < 4 && assets.some(a => !getImage(a))) setTimeout(() => healMissingImagePreviews(attempt + 1), 90000);
     }
 
     let traitBrowserOpen = true;
@@ -2620,6 +2663,7 @@
 
         renderGrid(renderedCount);
         renderTraitBrowser();
+        setTimeout(() => healMissingImagePreviews(), 90000);
 
         // Restore wallet + open card from URL (in case the fast-path lookup
         // above hasn't resolved yet, or the card wasn't found there).

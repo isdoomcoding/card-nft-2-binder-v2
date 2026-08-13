@@ -128,15 +128,25 @@ for (const st of Object.values(STATES))
 
 // === Traffic stats (in-memory, resets on restart — a deploy/pm2 restart resets the
 // "today" window early; not persisted to disk, this is meant as a rough signal, not
-// a source of truth). Also logs whether the funnel forwards a real client IP at all. ===
+// a source of truth). Visitor addresses are only ever held as salted digests, so
+// nothing here or in the daily [stats] log line identifies a visitor. ===
 const STATS_SECRET = process.env.STATS_SECRET || WEBHOOK_SECRET;
 let stats = freshStats();
 function freshStats() {
   return { since: Date.now(), pageLoads: 0, walletLookupsFresh: 0, walletLookupsCached: 0, ips: new Set(), pageLoadsBySlug: {} };
 }
+// Salt lives only in this process's memory and is regenerated on every restart, so the
+// digests below can't be correlated across restarts and can't be reversed by enumerating
+// the address space (unsalted, the whole IPv4 range is brute-forceable in seconds).
+const IP_SALT = crypto.randomBytes(32);
+function ipToken(req) {
+  // x-forwarded-for is a chain ("client, proxy1, proxy2"); the first hop is the client.
+  const raw = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+    || req.socket.remoteAddress || 'unknown';
+  return crypto.createHash('sha256').update(IP_SALT).update(raw).digest('hex').slice(0, 16);
+}
 function trackHit(req) {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  stats.ips.add(ip);
+  stats.ips.add(ipToken(req));
 }
 function statsSnapshot() {
   const collections = {};
@@ -154,7 +164,6 @@ function statsSnapshot() {
     walletLookupsFresh: stats.walletLookupsFresh,
     walletLookupsCached: stats.walletLookupsCached,
     uniqueIPsSeen: stats.ips.size,
-    sampleIP: stats.ips.size ? [...stats.ips][0] : null, // sanity check: is this a real client IP or always the funnel's?
     collections,
   };
 }
