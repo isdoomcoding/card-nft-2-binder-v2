@@ -253,6 +253,10 @@ function serveStatic(req, res, entry) {
   res.end(useGzip ? entry.gzip : entry.raw);
 }
 
+function assetHasImage(a) {
+  return !!(a?.content?.links?.image || (a?.content?.files || []).some(f => f?.mime && String(f.mime).startsWith('image')));
+}
+
 // Keep only the fields the binder UI actually reads → ~3x smaller payload.
 function slimAsset(a) {
   const md = a?.content?.metadata || {};
@@ -260,6 +264,35 @@ function slimAsset(a) {
     || (a?.content?.files || []).find(f => f?.mime && String(f.mime).startsWith('image'))?.uri
     || null;
   return { id: a?.id, content: { metadata: { name: md.name, attributes: md.attributes || [] }, links: { image } } };
+}
+
+// Helius sometimes finishes indexing an asset on-chain before it's parsed the
+// off-chain JSON at content.json_uri, leaving content.files/content.links empty —
+// observed in production to persist for hours across a bounded set of assets, not
+// just a brief lag. json_uri itself is always present once Helius has indexed the
+// asset at all, so fetch it directly as a fallback and patch the raw item in place
+// before slimAsset() runs, rather than leaving the card permanently blank
+// client-side. Best-effort: a failed fetch just leaves the asset as-is for the next
+// poll to retry.
+async function enrichMissingImages(rawItems) {
+  const needsFetch = rawItems.filter(it => !assetHasImage(it) && it?.content?.json_uri);
+  if (!needsFetch.length) return;
+  let i = 0;
+  async function worker() {
+    while (i < needsFetch.length) {
+      const it = needsFetch[i++];
+      try {
+        const r = await fetch(it.content.json_uri, { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) continue;
+        const json = await r.json();
+        if (json?.image) {
+          it.content.links = { ...it.content.links, image: json.image };
+          if (Array.isArray(json.attributes)) it.content.metadata = { ...it.content.metadata, attributes: json.attributes };
+        }
+      } catch { /* best-effort; the next poll retries */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(8, needsFetch.length) }, worker));
 }
 
 // Card number of an asset, or null if it isn't a card / card receipt.
@@ -291,7 +324,7 @@ function dataPath(rel) { return path.join(__dirname, rel); }
 // Also tallies minted card numbers (burnt-INCLUSIVE) for the unminted view:
 // a burnt `card N` was still minted once — its number is not "in a pack".
 async function fetchCollectionLive(st) {
-  const all = [];
+  const rawItems = [];
   const seen = new Set();
   const minted = st.un ? new Set() : null;
   let page = 1;
@@ -307,11 +340,13 @@ async function fetchCollectionLive(st) {
     const items = j.result?.items || [];
     for (const it of items) {
       if (minted) { const n = cardNumberOf(it); if (n != null) minted.add(n); }
-      if (it?.id && !it.burnt && !seen.has(it.id)) { seen.add(it.id); all.push(slimAsset(it)); }
+      if (it?.id && !it.burnt && !seen.has(it.id)) { seen.add(it.id); rawItems.push(it); }
     }
     if (items.length < 500) break;
     page++;
   }
+  await enrichMissingImages(rawItems);
+  const all = rawItems.map(slimAsset);
   // Array is newest-first (created desc). Stamp a mint-rank so the client can sort
   // by true creation order: higher m = more recently minted.
   const n = all.length;
@@ -394,7 +429,9 @@ async function fetchNewestAssets(st, limit = 100) {
   const r = await fetch(HELIUS_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
   const j = await r.json();
   if (j.error) throw new Error(JSON.stringify(j.error));
-  return (j.result?.items || []).filter(it => it?.id && !it.burnt).map(slimAsset);
+  const items = (j.result?.items || []).filter(it => it?.id && !it.burnt);
+  await enrichMissingImages(items);
+  return items.map(slimAsset);
 }
 
 async function revalidateNewest(st) {
