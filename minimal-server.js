@@ -148,6 +148,31 @@ function ipToken(req) {
 function trackHit(req) {
   stats.ips.add(ipToken(req));
 }
+
+// === Rate limiting (per-IP token, in-memory, fixed window) ===
+// /wallet is unauthenticated and triggers a live Helius call on every cache miss —
+// without this, a script can enumerate arbitrary addresses at will and burn RPC
+// credits. Keyed by the same salted ipToken() the privacy fix already uses.
+const RATE_LIMITS = new Map(); // ipToken -> { count, windowStart }
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX = 15; // generous for a visitor checking a few real wallets; tight for a scripted scan
+
+function rateLimited(req) {
+  const key = ipToken(req);
+  const now = Date.now();
+  let entry = RATE_LIMITS.get(key);
+  if (!entry || now - entry.windowStart >= RATE_WINDOW_MS) {
+    entry = { count: 0, windowStart: now };
+    RATE_LIMITS.set(key, entry);
+  }
+  entry.count++;
+  return entry.count > RATE_MAX;
+}
+// Sweep entries nobody's used in a while so idle IPs don't leak memory forever.
+setInterval(() => {
+  const cutoff = Date.now() - RATE_WINDOW_MS * 2;
+  for (const [key, entry] of RATE_LIMITS) if (entry.windowStart < cutoff) RATE_LIMITS.delete(key);
+}, RATE_WINDOW_MS * 2);
 function statsSnapshot() {
   const collections = {};
   for (const st of Object.values(STATES)) {
@@ -726,6 +751,9 @@ const server = http.createServer(async (req, res) => {
   // 1c. wallet?address=<addr> — which cards from this collection a wallet holds
   if (req.method === 'GET' && route === 'wallet') {
     if (!HELIUS_RPC) return writeJson(res, 503, { error: 'Wallet lookup needs a server Helius key.' });
+    if (rateLimited(req)) {
+      return writeJson(res, 429, { error: 'Too many wallet lookups. Please slow down and try again in a minute.' }, { 'retry-after': '60' });
+    }
     const sp = new URL(req.url, 'http://local').searchParams;
     const addr = (sp.get('address') || '').trim();
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return writeJson(res, 400, { error: 'Invalid Solana address.' });
