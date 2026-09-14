@@ -144,6 +144,7 @@ function createCollectionState(cfg) {
     walletCache: new Map(),  // address -> { mints:[], ts }
     tensorListings: null,    // { data:[{mint,price,seller,marketplace:'tensor'}], ts }
     tensorRefreshing: false, // guards background Tensor revalidation
+    _tensorColdStart: null,  // in-flight cold-start sweep, shared by concurrent callers
     firstSeen: loadFirstSeen(cfg.firstSeenFile), // mint -> ms first observed listed
     _whDebounce: null,       // webhook burst coalescing
     trade: createIntentStore(cfg.intentsFile),
@@ -579,13 +580,21 @@ async function fetchTensorListings(st) {
 async function getTensorListings(st) {
   if (!st.cfg.tensorListings || !HELIUS_RPC) return [];
   if (!st.tensorListings) {
-    try {
-      const data = await fetchTensorListings(st);
-      st.tensorListings = { data, ts: Date.now() };
-    } catch (e) {
-      console.error(`[tensor-listings:${st.cfg.slug}] initial fetch failed:`, e);
-      st.tensorListings = { data: [], ts: Date.now() }; // avoid retry-storming every request until TTL passes
+    // Concurrent requests during the cold-start window must share ONE sweep,
+    // not each launch their own: besides doubling Helius load, whichever
+    // sweep resolves last wins (both write st.tensorListings), so a second,
+    // more rate-limited request landing mid-cold-start could silently
+    // clobber a first request's more complete result with a worse one.
+    if (!st._tensorColdStart) {
+      st._tensorColdStart = fetchTensorListings(st)
+        .then(data => { st.tensorListings = { data, ts: Date.now() }; })
+        .catch(e => {
+          console.error(`[tensor-listings:${st.cfg.slug}] initial fetch failed:`, e);
+          st.tensorListings = { data: [], ts: Date.now() }; // avoid retry-storming every request until TTL passes
+        })
+        .finally(() => { st._tensorColdStart = null; });
     }
+    await st._tensorColdStart;
   } else if (!isFresh(st.tensorListings, TENSOR_LISTINGS_TTL) && !st.tensorRefreshing) {
     st.tensorRefreshing = true;
     fetchTensorListings(st)
