@@ -554,7 +554,16 @@ async function fetchTensorListings(st) {
   async function worker() {
     while (next < batches.length) {
       const batch = batches[next++];
-      results.push(...await fetchTensorBatch(batch));
+      // A batch that's still rate-limited after all retries must not take down
+      // the whole sweep — Promise.all below fails fast on the first rejection,
+      // which previously discarded every other batch's already-fetched results
+      // too. Losing ~100 listings from one stuck batch is fine; losing the
+      // other ~700 that succeeded is the actual bug this guards against.
+      try {
+        results.push(...await fetchTensorBatch(batch));
+      } catch (e) {
+        console.error(`[tensor-listings] batch ${batch[0]?.id}.. failed permanently, skipping:`, e.message);
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(TENSOR_FETCH_CONCURRENCY, batches.length) }, worker));
