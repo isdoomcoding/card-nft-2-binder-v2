@@ -571,7 +571,11 @@ async function sweepTensorBatches(batchList, concurrency, results) {
 }
 
 async function fetchTensorListings(st) {
-  if (!HELIUS_RPC || !st.collectionCache?.data?.length) return [];
+  if (!HELIUS_RPC) return [];
+  if (!st.collectionCache?.data?.length) {
+    console.log(`[tensor-listings:${st.cfg.slug}] skipped — collection cache not ready yet`);
+    return [];
+  }
   const assets = st.collectionCache.data;
   const batches = [];
   for (let i = 0; i < assets.length; i += 100) batches.push(assets.slice(i, i + 100));
@@ -579,15 +583,16 @@ async function fetchTensorListings(st) {
 
   const stillFailing = await sweepTensorBatches(batches, TENSOR_FETCH_CONCURRENCY, results);
   if (stillFailing.length > 0) {
-    console.error(`[tensor-listings] ${stillFailing.length} batch(es) rate-limited on pass 1, retrying once more after a pause`);
+    console.error(`[tensor-listings] ${stillFailing.length}/${batches.length} batch(es) rate-limited on pass 1, retrying once more after a pause`);
     await new Promise(res => setTimeout(res, 5000)); // give Helius's rate-limit window room to reset
     // Sequential this time — these are already the batches that couldn't
     // get through concurrently, so don't repeat the contention that caused it.
     const stillFailingAfterRetry = await sweepTensorBatches(stillFailing, 1, results);
     if (stillFailingAfterRetry.length > 0) {
-      console.error(`[tensor-listings] ${stillFailingAfterRetry.length} batch(es) still failing after pass 2, skipping until next refresh`);
+      console.error(`[tensor-listings] ${stillFailingAfterRetry.length}/${batches.length} batch(es) still failing after pass 2, skipping until next refresh`);
     }
   }
+  console.log(`[tensor-listings:${st.cfg.slug}] sweep done: ${results.length} listing(s) from ${batches.length} batch(es), ${stillFailing.length} needed a retry pass`);
   return results;
 }
 
