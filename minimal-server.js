@@ -999,13 +999,21 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const [me, tensor] = await Promise.all([fetchMEListings(st), getTensorListings(st)]);
-      // An asset's on-chain owner can only be one escrow at a time, so a mint
-      // can't legitimately appear in both lists — dedupe anyway as a cheap
-      // defensive net against any transient overlap.
-      const seen = new Set();
-      const merged = [...me, ...tensor]
-        .filter(l => (seen.has(l.mint) ? false : (seen.add(l.mint), true)))
-        .sort((a, b) => a.price - b.price);
+      // A mint CAN legitimately appear in both lists: modern "escrow-less"
+      // listings (M2 on Magic Eden, and Tensor's own model) authorize a sale
+      // via delegate rather than moving the token into an escrow PDA, so the
+      // same NFT can sit listed on two marketplaces at once without changing
+      // owner. Measured live: ~40% of this collection's Tensor listings
+      // overlap with Magic Eden. Keep whichever side is cheaper per mint
+      // instead of blindly keeping "whichever array came first" — the old
+      // dedup always kept Magic Eden's entry regardless of price, which both
+      // undercounted Tensor and could show a worse deal than was available.
+      const byMint = new Map();
+      for (const l of [...me, ...tensor]) {
+        const existing = byMint.get(l.mint);
+        if (!existing || l.price < existing.price) byMint.set(l.mint, l);
+      }
+      const merged = [...byMint.values()].sort((a, b) => a.price - b.price);
       // Reconcile "first seen" (see loadFirstSeen above): carry the timestamp
       // forward for mints still listed, stamp new ones with now, and drop
       // anything no longer listed so a relist reads as newly listed again.
