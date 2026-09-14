@@ -713,6 +713,14 @@
               <span class="text-base leading-none">↓</span> <span>High → Low</span>
             </button>
             <div class="mx-3 my-1 h-px bg-white/[0.06]"></div>
+            <div class="px-3 py-1.5 text-[10px] font-semibold tracking-widest text-zinc-600 uppercase">By Listing</div>
+            <button onclick="setSortOption('listed-desc')" id="sort-opt-listed-desc" class="sort-opt w-full text-left px-4 py-2.5 text-sm flex items-center gap-3 hover:bg-white/[0.05] transition">
+              <span class="text-base leading-none">🆕</span> <span>Latest listed</span>
+            </button>
+            <button onclick="setSortOption('listed-asc')" id="sort-opt-listed-asc" class="sort-opt w-full text-left px-4 py-2.5 text-sm flex items-center gap-3 hover:bg-white/[0.05] transition">
+              <span class="text-base leading-none">🕰️</span> <span>Oldest listed</span>
+            </button>
+            <div class="mx-3 my-1 h-px bg-white/[0.06]"></div>
             <button onclick="setSortOption('none')" id="sort-opt-none" class="sort-opt w-full text-left px-4 py-2.5 text-sm flex items-center gap-3 hover:bg-white/[0.05] transition text-zinc-500">
               Default order
             </button>
@@ -988,7 +996,7 @@
             if (!Array.isArray(page) || page.length === 0) break;
             all.push(...page);
           }
-          const listings = all.map(l => ({ mint: l.tokenMint || l.mint, priceSol: Number(l.price || 0), seller: l.seller, source: l.marketplace || 'magic-eden' }));
+          const listings = all.map(l => ({ mint: l.tokenMint || l.mint, priceSol: Number(l.price || 0), seller: l.seller, source: l.marketplace || 'magic-eden', listedAt: Number(l.listedAt) || 0 }));
           if (listings.length > 0) {
             lastListingsSuccess = true;
             if (!silent) console.info(`%c[Listings] ME:${listings.length}`, 'color:#0a0');
@@ -1264,6 +1272,7 @@
             priceSol: Number(l.priceSol || 0),
             source: isTensor ? 'tensor' : 'magiceden',
             marketLabel: isTensor ? 'Tensor' : 'Magic Eden',
+            listedAt: Number(l.listedAt || 0),
             url: isTensor
               ? `https://www.tensor.trade/item/${l.mint}`
               : `https://magiceden.io/item-details/${l.mint}`,
@@ -1333,10 +1342,15 @@
           return cardSort === 'num-asc' ? (na - nb) : (nb - na);
         });
       }
-      // Price sort only makes sense on the listed subset (and works together with trait filters)
+      // Price/listed-date sorts only make sense on the listed subset (and work together with trait filters)
       if (onlyListed && listingSort !== 'none') {
         const lm = listedMap();
         res = [...res].sort((a, b) => {
+          if (listingSort === 'listed-desc' || listingSort === 'listed-asc') {
+            const ta = lm[a.id]?.listedAt || 0;
+            const tb = lm[b.id]?.listedAt || 0;
+            return listingSort === 'listed-desc' ? (tb - ta) : (ta - tb);
+          }
           const pa = lm[a.id]?.priceSol || Infinity;
           const pb = lm[b.id]?.priceSol || Infinity;
           return listingSort === 'price-asc' ? (pa - pb) : (pb - pa);
@@ -1786,7 +1800,8 @@
 
     const SORT_LABELS = {
       'none': 'Sort', 'recent': 'Newest unpacked', 'oldest': 'Oldest unpacked', 'num-asc': '# Low → High', 'num-desc': '# High → Low',
-      'price-asc': '$ Low → High', 'price-desc': '$ High → Low'
+      'price-asc': '$ Low → High', 'price-desc': '$ High → Low',
+      'listed-desc': 'Latest listed', 'listed-asc': 'Oldest listed'
     };
 
     function getSortActive() {
@@ -1805,7 +1820,7 @@
         btn.classList.toggle('text-amber-300', on);
         btn.classList.toggle('border-white/10', !on);
       }
-      ['recent','oldest','num-asc','num-desc','price-asc','price-desc','none'].forEach(opt => {
+      ['recent','oldest','num-asc','num-desc','price-asc','price-desc','listed-desc','listed-asc','none'].forEach(opt => {
         const el = document.getElementById('sort-opt-' + opt);
         if (!el) return;
         const isActive = opt === active;
@@ -1820,6 +1835,7 @@
       else if (val === 'oldest') { cardSort = 'oldest'; listingSort = 'none'; }
       else if (val === 'num-asc' || val === 'num-desc') { cardSort = val; listingSort = 'none'; }
       else if (val === 'price-asc' || val === 'price-desc') { listingSort = val; cardSort = 'none'; }
+      else if (val === 'listed-desc' || val === 'listed-asc') { listingSort = val; cardSort = 'none'; }
       else { cardSort = 'none'; listingSort = 'none'; }
       syncSortToUrl();
       updateSortButtons();
@@ -1870,7 +1886,8 @@
       if (!v) return;
       const map = { newest:'recent', recent:'recent', oldest:'oldest',
                     'num-asc':'num-asc', 'num-desc':'num-desc',
-                    'price-asc':'price-asc', 'price-desc':'price-desc', none:'none' };
+                    'price-asc':'price-asc', 'price-desc':'price-desc',
+                    'listed-desc':'listed-desc', 'listed-asc':'listed-asc', none:'none' };
       if (map[v]) setSortOption(map[v]);
     }
 

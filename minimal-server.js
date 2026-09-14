@@ -81,6 +81,7 @@ const COLLECTIONS = {
     slimSnapshot: 'data/collection-slim.json',
     rawSnapshot: 'data/card-nft-2-collection.json',
     intentsFile: 'data/trade-intents.json',
+    firstSeenFile: 'data/listing-first-seen.json',
     unminted: null,
     tensorListings: true, // opt-in — derives Tensor's on-chain list_state PDAs (see fetchTensorListings)
   },
@@ -94,6 +95,7 @@ const COLLECTIONS = {
     slimSnapshot: 'data/poncho-collection-slim.json',
     rawSnapshot: 'data/poncho-collection.json',
     intentsFile: 'data/trade-intents-poncho.json',
+    firstSeenFile: 'data/listing-first-seen-poncho.json',
     // The full 207-card set's metadata/art is pre-published on mons.link, so cards
     // still sealed in packs (never minted on-chain) can be previewed.
     unminted: {
@@ -118,6 +120,22 @@ const TENSOR_LISTINGS_TTL = 10 * 60_000;
 const TENSOR_MKT_PROGRAM_BYTES = bs58.decode('TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp');
 const WALLET_TTL = 60_000;          // 60s per-address holdings cache
 
+// Neither marketplace's API exposes when a listing was created, so "latest
+// listed" is tracked by us instead: the first time a mint is observed in the
+// merged listings, it's stamped with that moment, then carried forward while
+// it stays listed. Persisted so a redeploy doesn't make every listing look
+// brand new. See the /listings route for where this gets reconciled.
+function loadFirstSeen(file) {
+  try { return new Map(Object.entries(JSON.parse(fs.readFileSync(dataPath(file), 'utf8')))); }
+  catch { return new Map(); }
+}
+function saveFirstSeen(file, map) {
+  try {
+    fs.mkdirSync(path.dirname(dataPath(file)), { recursive: true });
+    fs.writeFileSync(dataPath(file), JSON.stringify(Object.fromEntries(map)));
+  } catch (e) { console.error('[first-seen] save failed:', e); }
+}
+
 function createCollectionState(cfg) {
   return {
     cfg,
@@ -126,6 +144,7 @@ function createCollectionState(cfg) {
     walletCache: new Map(),  // address -> { mints:[], ts }
     tensorListings: null,    // { data:[{mint,price,seller,marketplace:'tensor'}], ts }
     tensorRefreshing: false, // guards background Tensor revalidation
+    firstSeen: loadFirstSeen(cfg.firstSeenFile), // mint -> ms first observed listed
     _whDebounce: null,       // webhook burst coalescing
     trade: createIntentStore(cfg.intentsFile),
     // unminted state (only used when cfg.unminted is set)
@@ -944,6 +963,20 @@ const server = http.createServer(async (req, res) => {
       const merged = [...me, ...tensor]
         .filter(l => (seen.has(l.mint) ? false : (seen.add(l.mint), true)))
         .sort((a, b) => a.price - b.price);
+      // Reconcile "first seen" (see loadFirstSeen above): carry the timestamp
+      // forward for mints still listed, stamp new ones with now, and drop
+      // anything no longer listed so a relist reads as newly listed again.
+      const firstSeenNow = Date.now();
+      let firstSeenChanged = merged.length !== st.firstSeen.size;
+      const nextFirstSeen = new Map();
+      for (const l of merged) {
+        let ts = st.firstSeen.get(l.mint);
+        if (ts === undefined) { ts = firstSeenNow; firstSeenChanged = true; }
+        nextFirstSeen.set(l.mint, ts);
+        l.listedAt = ts;
+      }
+      st.firstSeen = nextFirstSeen;
+      if (firstSeenChanged) saveFirstSeen(st.cfg.firstSeenFile, st.firstSeen);
       if (merged.length > 0 || !cached) listingsCache.set(key, { data: merged, ts: Date.now() });
       const slice = listingsCache.get(key).data.slice(offset, offset + limit);
       return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json',
