@@ -512,12 +512,14 @@ function decodeTensorListState(b64) {
 // Helius key already used elsewhere (the free public RPCs used for exploring
 // this don't support the calls this needs at collection scale). ~90 calls for
 // the whole collection, run with bounded concurrency. Measured: ~28s
-// sequentially; 8-wide hit Helius's rate limit (429), so this runs at 3-wide
-// with a backoff-and-retry on 429 — still a large speedup over sequential,
-// safely under the limit. This only ever runs in the background per
-// TENSOR_LISTINGS_TTL, never on the request path, but faster still means a
-// fresher cache and a shorter cold-start block on first boot.
-const TENSOR_FETCH_CONCURRENCY = 3;
+// sequentially; 8-wide hit Helius's rate limit (429) hard, 3-wide still lost
+// several batches even on an otherwise-idle key (this collection's sweep is
+// just bigger than that budget tolerates) — 2-wide plus a second retry pass
+// below (see fetchTensorListings) is what actually stays clean. This only
+// ever runs in the background per TENSOR_LISTINGS_TTL, never on the request
+// path, so the extra time costs nothing user-facing except a slightly later
+// cache update.
+const TENSOR_FETCH_CONCURRENCY = 2;
 async function fetchTensorBatch(batch, attempt = 1) {
   const pdas = batch.map(a => tensorListStatePda(a.id));
   const body = JSON.stringify({
@@ -545,29 +547,47 @@ async function fetchTensorBatch(batch, attempt = 1) {
   });
   return out;
 }
+// Runs `batchList` at `concurrency`-wide, collecting successes into the
+// shared `results` array and returning whichever batches still failed after
+// their own internal retries — so the caller can decide what to do with the
+// stragglers instead of one stuck batch taking the whole sweep down (that
+// was the original bug: Promise.all fails fast, discarding every other
+// batch's already-fetched results along with the one that never succeeded).
+async function sweepTensorBatches(batchList, concurrency, results) {
+  let next = 0;
+  const failed = [];
+  async function worker() {
+    while (next < batchList.length) {
+      const batch = batchList[next++];
+      try {
+        results.push(...await fetchTensorBatch(batch));
+      } catch (e) {
+        failed.push(batch);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, batchList.length) }, worker));
+  return failed;
+}
+
 async function fetchTensorListings(st) {
   if (!HELIUS_RPC || !st.collectionCache?.data?.length) return [];
   const assets = st.collectionCache.data;
   const batches = [];
   for (let i = 0; i < assets.length; i += 100) batches.push(assets.slice(i, i + 100));
-  let next = 0;
   const results = [];
-  async function worker() {
-    while (next < batches.length) {
-      const batch = batches[next++];
-      // A batch that's still rate-limited after all retries must not take down
-      // the whole sweep — Promise.all below fails fast on the first rejection,
-      // which previously discarded every other batch's already-fetched results
-      // too. Losing ~100 listings from one stuck batch is fine; losing the
-      // other ~700 that succeeded is the actual bug this guards against.
-      try {
-        results.push(...await fetchTensorBatch(batch));
-      } catch (e) {
-        console.error(`[tensor-listings] batch ${batch[0]?.id}.. failed permanently, skipping:`, e.message);
-      }
+
+  const stillFailing = await sweepTensorBatches(batches, TENSOR_FETCH_CONCURRENCY, results);
+  if (stillFailing.length > 0) {
+    console.error(`[tensor-listings] ${stillFailing.length} batch(es) rate-limited on pass 1, retrying once more after a pause`);
+    await new Promise(res => setTimeout(res, 5000)); // give Helius's rate-limit window room to reset
+    // Sequential this time — these are already the batches that couldn't
+    // get through concurrently, so don't repeat the contention that caused it.
+    const stillFailingAfterRetry = await sweepTensorBatches(stillFailing, 1, results);
+    if (stillFailingAfterRetry.length > 0) {
+      console.error(`[tensor-listings] ${stillFailingAfterRetry.length} batch(es) still failing after pass 2, skipping until next refresh`);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(TENSOR_FETCH_CONCURRENCY, batches.length) }, worker));
   return results;
 }
 
