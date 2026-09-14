@@ -26,6 +26,17 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+// Deliberately NOT importing @solana/web3.js: it pulls in rpc-websockets (for its
+// Connection/subscription client, unused here) whose ESM/CJS interop was observed
+// to intermittently stall module evaluation for minutes at a time. The one thing
+// actually needed — Tensor's PDA derivation — is ported by hand below from
+// @solana/web3.js's own PublicKey.findProgramAddressSync/isOnCurve source, using
+// only crypto (already imported) + these two small, dependency-free libraries
+// (both already used elsewhere in this project's package.json / already present
+// as web3.js's own transitive deps). Cross-checked byte-for-byte against
+// @solana/web3.js's real output before shipping — see pda-crossverify.mjs.
+import { ed25519 } from '@noble/curves/ed25519';
+import bs58 from 'bs58';
 import { createIntentStore, issueNonce, verifySignIn, resolveToken, loadSessionsFromDisk, SOL_ADDR } from './trade.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +82,7 @@ const COLLECTIONS = {
     rawSnapshot: 'data/card-nft-2-collection.json',
     intentsFile: 'data/trade-intents.json',
     unminted: null,
+    tensorListings: true, // opt-in — derives Tensor's on-chain list_state PDAs (see fetchTensorListings)
   },
   poncho: {
     slug: 'poncho',
@@ -99,6 +111,11 @@ const COLLECTIONS = {
 // === Listings cache (keys are namespaced per collection) ===
 const listingsCache = new Map();
 const LISTINGS_TTL = 30_000;
+// Tensor listings are read on-chain via Helius (credits money), unlike ME's free
+// API — kept on a much longer TTL for that reason. 10 min still updates far
+// faster than a browsing session is likely to notice, at a fraction of the cost.
+const TENSOR_LISTINGS_TTL = 10 * 60_000;
+const TENSOR_MKT_PROGRAM_BYTES = bs58.decode('TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp');
 const WALLET_TTL = 60_000;          // 60s per-address holdings cache
 
 function createCollectionState(cfg) {
@@ -107,6 +124,8 @@ function createCollectionState(cfg) {
     collectionCache: null,   // { data, ts, body:Buffer, gzip:Buffer }
     refreshing: false,       // guards background revalidation
     walletCache: new Map(),  // address -> { mints:[], ts }
+    tensorListings: null,    // { data:[{mint,price,seller,marketplace:'tensor'}], ts }
+    tensorRefreshing: false, // guards background Tensor revalidation
     _whDebounce: null,       // webhook burst coalescing
     trade: createIntentStore(cfg.intentsFile),
     // unminted state (only used when cfg.unminted is set)
@@ -423,6 +442,130 @@ async function fetchMEListings(st) {
     // the last page), so only a truly empty page means "no more results".
   }
   return out;
+}
+
+// === Listings: Tensor (on-chain — their REST API is gated behind an
+// application-only key, so this derives Tensor's own deterministic per-asset
+// PDA instead). Verified against mainnet: seeds ["list_state", assetAddress],
+// program TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfCZsDp. A non-null account at
+// that address IS an active listing — the program closes the account on
+// cancel/buy, so existence alone is the signal; no need to also read the
+// asset's own owner field to classify it. ===
+// Hand-rolled PDA derivation (see the import comment above for why this isn't
+// just PublicKey.findProgramAddressSync). Mirrors Solana's own algorithm exactly:
+// sha256(seeds + programId + bumpByte + "ProgramDerivedAddress"), trying bump
+// 255 downward until the hash lands OFF the ed25519 curve — a valid PDA must
+// have no corresponding private key, which "off curve" guarantees.
+function isOnEd25519Curve(bytes) {
+  try { ed25519.ExtendedPoint.fromHex(bytes); return true; }
+  catch { return false; }
+}
+function tensorListStatePda(assetAddress) {
+  const assetBytes = bs58.decode(assetAddress);
+  const seedTag = Buffer.from('list_state');
+  const domain = Buffer.from('ProgramDerivedAddress');
+  for (let bump = 255; bump > 0; bump--) {
+    const preimage = Buffer.concat([seedTag, assetBytes, Buffer.from([bump]), TENSOR_MKT_PROGRAM_BYTES, domain]);
+    const hash = crypto.createHash('sha256').update(preimage).digest();
+    if (!isOnEd25519Curve(hash)) return bs58.encode(hash);
+  }
+  throw new Error(`no valid PDA found for asset ${assetAddress}`);
+}
+
+// ListState layout (317 bytes), verified by decoding a live 0.4 SOL listing.
+// Options are borsh-variable so this must be walked sequentially.
+function decodeTensorListState(b64) {
+  const b = Buffer.from(b64, 'base64');
+  if (b.length < 83) return null; // too short to be a real ListState — ignore
+  let o = 8;               // discriminator
+  o += 2;                  // version, bump
+  const seller = bs58.encode(b.subarray(o, o + 32)); o += 32;
+  o += 32;                 // asset_id — already known, it's the asset we queried for
+  const amount = b.readBigUInt64LE(o); o += 8;
+  const curTag = b.readUInt8(o); o += 1;
+  if (curTag !== 0) return null; // SPL-token-denominated listing — client only displays SOL
+  const expiry = b.readBigInt64LE(o);
+  return { seller, sol: Number(amount) / 1e9, expiry: Number(expiry) };
+}
+
+// Batched getMultipleAccounts over every asset's derived PDA, via the same
+// Helius key already used elsewhere (the free public RPCs used for exploring
+// this don't support the calls this needs at collection scale). ~90 calls for
+// the whole collection, run with bounded concurrency. Measured: ~28s
+// sequentially; 8-wide hit Helius's rate limit (429), so this runs at 3-wide
+// with a backoff-and-retry on 429 — still a large speedup over sequential,
+// safely under the limit. This only ever runs in the background per
+// TENSOR_LISTINGS_TTL, never on the request path, but faster still means a
+// fresher cache and a shorter cold-start block on first boot.
+const TENSOR_FETCH_CONCURRENCY = 3;
+async function fetchTensorBatch(batch, attempt = 1) {
+  const pdas = batch.map(a => tensorListStatePda(a.id));
+  const body = JSON.stringify({
+    jsonrpc: '2.0', id: 'tensor-listings', method: 'getMultipleAccounts',
+    params: [pdas, { encoding: 'base64' }],
+  });
+  const r = await fetch(HELIUS_RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  if (r.status === 429) {
+    if (attempt > 4) throw new Error('tensor-listings: rate limited after 4 retries');
+    await new Promise(res => setTimeout(res, 500 * 2 ** (attempt - 1)));
+    return fetchTensorBatch(batch, attempt + 1);
+  }
+  if (!r.ok) throw new Error(`tensor-listings: HTTP ${r.status}`);
+  const j = await r.json();
+  if (j.error) throw new Error(JSON.stringify(j.error));
+  const accounts = j.result?.value || [];
+  const now = Date.now() / 1000;
+  const out = [];
+  accounts.forEach((acct, idx) => {
+    if (!acct?.data?.[0]) return;
+    const ls = decodeTensorListState(acct.data[0]);
+    if (!ls) return;
+    if (ls.expiry && ls.expiry < now) return; // expired, program just hasn't closed it yet
+    out.push({ mint: batch[idx].id, price: ls.sol, seller: ls.seller, marketplace: 'tensor' });
+  });
+  return out;
+}
+async function fetchTensorListings(st) {
+  if (!HELIUS_RPC || !st.collectionCache?.data?.length) return [];
+  const assets = st.collectionCache.data;
+  const batches = [];
+  for (let i = 0; i < assets.length; i += 100) batches.push(assets.slice(i, i + 100));
+  let next = 0;
+  const results = [];
+  async function worker() {
+    while (next < batches.length) {
+      const batch = batches[next++];
+      results.push(...await fetchTensorBatch(batch));
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(TENSOR_FETCH_CONCURRENCY, batches.length) }, worker));
+  return results;
+}
+
+// SWR wrapper: the very first call after a cold start blocks once (so Tensor
+// data isn't just silently absent forever), every call after that returns
+// whatever's cached immediately and kicks off a background refresh if stale —
+// this is what keeps the /listings response fast regardless of Tensor's own
+// ~90-call fetch time. Mirrors the same cold-start-blocks-once-then-SWR
+// convention already used for /collection.
+async function getTensorListings(st) {
+  if (!st.cfg.tensorListings || !HELIUS_RPC) return [];
+  if (!st.tensorListings) {
+    try {
+      const data = await fetchTensorListings(st);
+      st.tensorListings = { data, ts: Date.now() };
+    } catch (e) {
+      console.error(`[tensor-listings:${st.cfg.slug}] initial fetch failed:`, e);
+      st.tensorListings = { data: [], ts: Date.now() }; // avoid retry-storming every request until TTL passes
+    }
+  } else if (!isFresh(st.tensorListings, TENSOR_LISTINGS_TTL) && !st.tensorRefreshing) {
+    st.tensorRefreshing = true;
+    fetchTensorListings(st)
+      .then(data => { st.tensorListings = { data, ts: Date.now() }; })
+      .catch(e => console.error(`[tensor-listings:${st.cfg.slug}] refresh failed:`, e))
+      .finally(() => { st.tensorRefreshing = false; });
+  }
+  return st.tensorListings.data;
 }
 
 // Refresh the collection cache in the background (stale-while-revalidate).
@@ -774,9 +917,13 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 2. ME listings — fetch all pages, merge + sort by price, cache as one
-  // blob per collection (30s), then slice for pagination. One upstream sweep
-  // serves every paginated request instead of proxying page-by-page.
+  // 2. Listings — ME fetched fresh (all pages, 30s cache) merged with whatever
+  // Tensor data is currently cached (see getTensorListings — on its own much
+  // longer TTL since those reads cost Helius credits and ME's don't). Tensor
+  // only blocks this request on the very first call after a cold start; every
+  // call after that returns cached data immediately, so it can't add latency
+  // here in steady state. One upstream sweep serves every paginated request
+  // instead of proxying page-by-page.
   if (req.method === 'GET' && route === 'listings') {
     // Sanitize input: only offset/limit are honoured, clamped to sane ranges.
     const sp = new URL(req.url, 'http://local').searchParams;
@@ -789,12 +936,18 @@ const server = http.createServer(async (req, res) => {
       return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json', { 'x-cached': 'true' });
     }
     try {
-      const me = await fetchMEListings(st);
-      const merged = me.sort((a, b) => a.price - b.price);
+      const [me, tensor] = await Promise.all([fetchMEListings(st), getTensorListings(st)]);
+      // An asset's on-chain owner can only be one escrow at a time, so a mint
+      // can't legitimately appear in both lists — dedupe anyway as a cheap
+      // defensive net against any transient overlap.
+      const seen = new Set();
+      const merged = [...me, ...tensor]
+        .filter(l => (seen.has(l.mint) ? false : (seen.add(l.mint), true)))
+        .sort((a, b) => a.price - b.price);
       if (merged.length > 0 || !cached) listingsCache.set(key, { data: merged, ts: Date.now() });
       const slice = listingsCache.get(key).data.slice(offset, offset + limit);
       return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json',
-        { 'x-cached': 'false', 'x-source': `me:${me.length}` });
+        { 'x-cached': 'false', 'x-source': `me:${me.length}+tensor:${tensor.length}` });
     } catch (e) {
       console.error(`[listings:${st.cfg.slug}] fetch failed:`, e);
       const c = listingsCache.get(key);

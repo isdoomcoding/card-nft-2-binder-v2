@@ -1259,9 +1259,14 @@
       listings.forEach(l => {
         if (l?.mint) {
           const source = (l.source || '').toLowerCase();
+          const isTensor = source === 'tensor';
           map[l.mint] = {
             priceSol: Number(l.priceSol || 0),
-            url: `https://magiceden.io/item-details/${l.mint}`
+            source: isTensor ? 'tensor' : 'magiceden',
+            marketLabel: isTensor ? 'Tensor' : 'Magic Eden',
+            url: isTensor
+              ? `https://www.tensor.trade/item/${l.mint}`
+              : `https://magiceden.io/item-details/${l.mint}`,
           };
         }
       });
@@ -2090,7 +2095,7 @@
         if (listed) {
           a.href = listed.url;
           a.className = 'inline-flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-5 py-2 rounded-2xl transition';
-          a.innerHTML = `Buy on Magic Eden — ${listed.priceSol.toFixed(2)} SOL ↗`;
+          a.innerHTML = `Buy on ${listed.marketLabel} — ${listed.priceSol.toFixed(2)} SOL ↗`;
         } else {
           a.href = `https://magiceden.io/item-details/${asset.id}`;
           a.className = 'inline-flex items-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-5 py-2 rounded-2xl transition';
